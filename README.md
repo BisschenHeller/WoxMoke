@@ -1,5 +1,5 @@
 # 3D Voxel Smoke as a combination of Path tracing and deferred rendering
-![Screenshot from the demo](Screenshots/Thumbnail Cropped.png)
+![Screenshot from the demo](Screenshots/ThumbnailCropped.png)
 by Tobias Heller
 
 ## What was accomplished
