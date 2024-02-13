@@ -1,0 +1,400 @@
+#version 450
+#extension GL_KHR_vulkan_glsl : enable
+
+#define VALUE_Wall (500.0f)
+#define VALUE_Empty (0.0f)
+#define EULER (2.71828)
+
+#define MAGIC_NUM_SMALL (100)
+#define MAGIC_NUM_BIG (50)
+#define SPEED_BIG (30)
+#define SPEED_SMALL (60)
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 1) in;
+
+//
+//                              Input Layout
+//
+//                                  Set 0  Binding 0  CameraData
+//
+//                                  Set 0  Binding 1  VoxelInfo
+//                                  Set 0  Binding 2  Voxels
+//                                  Set 0  Binding 3  scene_depth
+//                                  Set 0  Binding 4  Worley
+//                                  Set 0  Binding 5  GeneralInfo
+//                                  Set 0  Binding 6  out screen
+//                                  Set 0  Binding 7  lights
+//
+
+layout(set = 0, binding = 0) uniform CameraData {
+	mat4 toWorld;
+} camera;
+
+layout(set = 0, binding = 1, std140) uniform VoxelInfo {
+    uvec3 voxel_count;
+    vec3 smoke_min_coord;
+    vec3 smoke_max_coord;
+    vec3 world_measurements;
+    vec3 voxel_size;
+    vec3 smoke_center;
+    vec3 smoke_radius;
+    vec3 swipe;
+} voxelInfo;
+
+layout(set = 0, binding = 2) buffer Voxels {
+    float data[120*120*20];
+} voxels;
+
+layout(set=0, binding = 3) uniform sampler2D scene_depth;
+
+//layout(set=0, binding = 4) uniform sampler3D worley;
+layout(set=0, binding = 4) buffer Worley {
+    float worley[128][128][128];
+};
+
+layout(set = 0, binding = 5) uniform GeneralInfo {
+    float timer;
+} info;
+
+layout(rgba32f, set=0, binding = 6) uniform writeonly image2D screen;
+
+layout(set=0, binding = 7) buffer Lights {
+    vec3 colors[51];
+    vec3 positions[51];
+} light;
+
+layout(set=0,binding=8, std140) uniform BulletHoles {
+    vec3 position[30];
+    vec3 direction[30];
+    vec3 timers[30];
+    uint count;
+} bullet;
+
+layout(set=0, binding = 9) uniform sampler2D bullethole;
+
+//  
+//
+//                              Shader Code
+//
+//
+
+vec3 bounds;
+float voxel_size_half;
+
+float ease_radius(float t) {
+    //return 1-t;   // Linear
+
+    if (t <= 0.1f) {
+        return pow(t/0.1,4);
+    } else {
+        return pow((t-1)/0.9,4);
+    }
+    
+}
+
+
+
+uvec3 convert_world_coordinate_to_voxel(vec3 coordinate) {
+    float voxel_size = voxelInfo.voxel_size.x;
+
+    if (coordinate.x > bounds.x || coordinate.x < 0) return uvec3(999999999);
+    if (coordinate.y > bounds.y || coordinate.y < 0) return uvec3(999999999);
+    if (coordinate.z > bounds.z || coordinate.z < 0) return uvec3(999999999);
+	
+	return uvec3(floor(coordinate / voxelInfo.voxel_size));
+}
+
+uint convert_voxel_coordinates_to_index(uvec3 voxel_coordinate) {
+    if (voxel_coordinate.x > voxelInfo.voxel_count.x 
+    || voxel_coordinate.y > voxelInfo.voxel_count.y
+    || voxel_coordinate.z > voxelInfo.voxel_count.z ) return 999999999;
+	return voxel_coordinate.x * voxelInfo.voxel_count.y * voxelInfo.voxel_count.z + voxel_coordinate.y * voxelInfo.voxel_count.z + voxel_coordinate.z;
+}
+
+float get_smoke_value_at(uvec3 voxel_coordinate) {
+    float value = voxels.data[convert_voxel_coordinates_to_index(voxel_coordinate)];
+    if (value >= VALUE_Wall) return voxelInfo.smoke_radius.x;
+    //if (value >= VALUE_Wall) return voxelInfo.smoke_radius.x-0.5;
+    if (value == 0) return voxelInfo.smoke_radius.x+0.5;
+    return value;
+}
+
+struct LightData {
+  vec3 color;
+  vec3 position;
+};
+
+float sample_worley_buffer_nearest(vec3 pos) {
+    return worley
+        [int(mod(floor(abs(pos.x)),128))]
+        [int(mod(floor(abs(pos.y)),128))]
+        [int(mod(floor(abs(pos.z)),128))];
+}
+
+float sample_worley_buffer_trilin_b(uvec3 pos, vec3 nachkomma) {
+
+    float x0y0z0 = worley[((pos.x)  ) % 128][((pos.y)  ) % 128][((pos.z)  ) % 128];
+    float x0y0z1 = worley[((pos.x)  ) % 128][((pos.y)  ) % 128][((pos.z)+1) % 128];
+    float x0y1z0 = worley[((pos.x)  ) % 128][((pos.y)+1) % 128][((pos.z)  ) % 128];
+    float x0y1z1 = worley[((pos.x)  ) % 128][((pos.y)+1) % 128][((pos.z)+1) % 128];
+    float x1y0z0 = worley[((pos.x)+1) % 128][((pos.y)  ) % 128][((pos.z)  ) % 128];
+    float x1y0z1 = worley[((pos.x)+1) % 128][((pos.y)  ) % 128][((pos.z)+1) % 128];
+    float x1y1z0 = worley[((pos.x)+1) % 128][((pos.y)+1) % 128][((pos.z)  ) % 128];
+    float x1y1z1 = worley[((pos.x)+1) % 128][((pos.y)+1) % 128][((pos.z)+1) % 128];
+
+    float interpolated_value = (1 - nachkomma.z) * ((1 - nachkomma.x) * (1 - nachkomma.y) * x0y0z0 + nachkomma.x * (1 - nachkomma.y) * x1y0z0 +
+                                   (1 - nachkomma.x) * nachkomma.y * x0y1z0 + nachkomma.x * nachkomma.y * x1y1z0) + \
+                          nachkomma.z * ((1 - nachkomma.x) * (1 - nachkomma.y) * x0y0z1 + nachkomma.x * (1 - nachkomma.y) * x1y0z1 +
+                               (1 - nachkomma.x) * nachkomma.y * x0y1z1 + nachkomma.x * nachkomma.y * x1y1z1);
+
+    return interpolated_value;
+}
+
+float get_bullet_density(vec3 currentPos) {
+    float bullet_rad = 0.25;
+    if (bullet.count == 0) return 1;
+    float ret = 1;
+    for (int i = 0; i < bullet.count; i++) {
+        float current_radius = bullet_rad * ease_radius(bullet.timers[i].x);
+        vec3 pointToLineStart = currentPos - (bullet.position[i] + vec3(0,bullet.timers[i].x * sample_worley_buffer_nearest(currentPos),0));
+
+        float dist = distance(cross(pointToLineStart, bullet.direction[i]) / distance(bullet.direction[i], vec3(0)), vec3(0));
+        
+        if (dist < current_radius) {
+            return 0;
+            //ret -= texture(bullethole, vec2(dist+0.5,dist+0.5)).r;
+        }
+    }
+    
+    return ret;
+}
+
+float sample_voxels_trilin(vec3 worldCoord) {
+
+    // Convert world coordinates to voxel coordinates
+    vec3 voxelCoord = worldCoord / voxelInfo.voxel_size;
+
+    // Get the integer and fractional parts of voxel coordinates
+    ivec3 baseCoord = ivec3(floor(voxelCoord));
+    vec3 fracCoord = voxelCoord - vec3(baseCoord);
+
+    // Compute interpolation coefficients
+    vec3 uvw = fracCoord;
+    vec3 oneMinusUVW = 1.0 - uvw;
+
+    // Compute trilinear interpolation
+    float c000 = get_smoke_value_at(baseCoord + uvec3(0.0, 0.0, 0.0));
+    float c001 = get_smoke_value_at(baseCoord + uvec3(0.0, 0.0, 1.0));
+    float c010 = get_smoke_value_at(baseCoord + uvec3(0.0, 1.0, 0.0));
+    float c011 = get_smoke_value_at(baseCoord + uvec3(0.0, 1.0, 1.0));
+    float c100 = get_smoke_value_at(baseCoord + uvec3(1.0, 0.0, 0.0));
+    float c101 = get_smoke_value_at(baseCoord + uvec3(1.0, 0.0, 1.0));
+    float c110 = get_smoke_value_at(baseCoord + uvec3(1.0, 1.0, 0.0));
+    float c111 = get_smoke_value_at(baseCoord + uvec3(1.0, 1.0, 1.0));
+    
+    float result = mix(
+        mix(mix(c000, c100, uvw.x), mix(c010, c110, uvw.x), uvw.y),
+        mix(mix(c001, c101, uvw.x), mix(c011, c111, uvw.x), uvw.y),
+        uvw.z
+    );
+
+    return result;
+}
+
+float getCombinedWorleyOffset(vec3 currentPos) {
+    // Determines how much of the small and how much of the big sample go into the result
+    // 0 -> only big noise
+    // 1 -> only small noise
+    float weight = 0.3; 
+    
+    vec3 pos_2b_sampled_big = currentPos * MAGIC_NUM_BIG + vec3(0, -SPEED_BIG*info.timer, 0) + vec3(400000);
+    uvec3 sample_for_big_noise = uvec3(floor(abs(pos_2b_sampled_big)));
+    vec3 nachkomma_big = pos_2b_sampled_big - sample_for_big_noise;
+
+    vec3 pos_2b_sampled_small = currentPos * MAGIC_NUM_SMALL + vec3(0, -SPEED_SMALL*info.timer, 0) + vec3(400000);
+    uvec3 sample_for_small_noise = uvec3(floor(abs(pos_2b_sampled_small)));
+    vec3 nachkomma_small = pos_2b_sampled_small - sample_for_small_noise;
+
+    float worley_offset_big = sample_worley_buffer_trilin_b(sample_for_big_noise, nachkomma_big);
+    float worley_offset_small = sample_worley_buffer_trilin_b(sample_for_small_noise, nachkomma_small);
+    
+    return mix(worley_offset_big, worley_offset_small, weight);
+}
+
+// Box-Ray Intersection
+bool chance_to_intersect(vec3 ray_origin, vec3 ray_direction) {
+    float tMin = (voxelInfo.smoke_min_coord.x - ray_origin.x) / ray_direction.x;
+    float tMax = (voxelInfo.smoke_max_coord.x - ray_origin.x) / ray_direction.x;
+
+    if (tMin > tMax) {
+        float temp = tMax;
+        tMax = tMin;
+        tMin = temp;
+    }
+
+    float tyMin = (voxelInfo.smoke_min_coord.y - ray_origin.y) / ray_direction.y;
+    float tyMax = (voxelInfo.smoke_max_coord.y - ray_origin.y) / ray_direction.y;
+
+    if (tyMin > tyMax) {
+        float temp = tyMax;
+        tyMax = tyMin;
+        tyMin = temp;
+    }
+
+    if ((tMin > tyMax) || (tyMin > tMax)) {
+        return false;
+    }
+
+    if (tyMin > tMin) {
+        tMin = tyMin;
+    }
+
+    if (tyMax < tMax) {
+        tMax = tyMax;
+    }
+
+    float tzMin = (voxelInfo.smoke_min_coord.z - ray_origin.z) / ray_direction.z;
+    float tzMax = (voxelInfo.smoke_max_coord.z - ray_origin.z) / ray_direction.z;
+
+    if (tzMin > tzMax) {
+        float temp = tzMax;
+        tzMax = tzMin;
+        tzMin = temp;
+    }
+
+    if ((tMin > tzMax) || (tzMin > tMax)) {
+        return false;
+    }
+
+    return true;
+}
+
+float getAttenuation(float distanz) {
+    // Tried some values and these were pretty okay
+    float constantAttenuation = 0;
+    float linearAttenuation = 1000;
+    float quadraticAttenuation = 3000;
+
+    return 1.0 / (constantAttenuation +
+                  linearAttenuation * distanz +
+                  quadraticAttenuation * distanz * distanz);
+}
+
+vec3 getLightColor(vec3 currentPos) {
+    
+    vec3 col = vec3(0);
+    for (int i = 0; i < 51; i++) {
+        float distanz_zu_licht = distance(currentPos, light.positions[i]);
+        //if (distanz_zu_licht > 10) continue;
+        col += getAttenuation(distanz_zu_licht) * light.colors[i];
+    }
+    return col;
+}
+
+// Performs the path tracing
+vec4 voxel_addition() {
+    float fov = radians(79.5);
+    float aspect_ratio = 1920.0f / 1080.0f;
+    float offset_nach_vorne =tan(fov / aspect_ratio);
+
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+
+	ivec2 output_dims = imageSize(screen);
+    ivec2 input_dims = ivec2(1920, 1080);
+
+
+	float screenPosX = -( float(pixel_coords.x*2 - output_dims.x) / output_dims.x);
+	float screenPosY = -( float(pixel_coords.y*2 - output_dims.y) / output_dims.y) * (1/aspect_ratio);
+
+    vec3 rayOrigin = (camera.toWorld * vec4(0,0,0,1)).xyz;
+
+    vec3 rayDirection = normalize((camera.toWorld * vec4(screenPosX, screenPosY, offset_nach_vorne, 0)).xyz);
+
+    float stepSize = 0.1;
+    
+    // If we're not hitting the bounding box of the smoke we can just give up right away :(
+    if (!chance_to_intersect(rayOrigin, rayDirection)) return vec4(0);
+
+    // Read scene depth from render result
+    vec2 uvs = 4 * (gl_GlobalInvocationID.xy) * vec2(1.0f/1920, 1.0f/1080); uvs.y = 1 - uvs.y;
+    float maxDistance = texture(scene_depth, uvs).w;
+    if (maxDistance == 0) maxDistance = 50;
+
+    float currentDistance = 0.0;
+
+    int i = 0;
+    float absorption = 0;
+    vec3 illumination = vec3(0);
+    float first_depth = 8000;
+    uint steps_behind = 0;
+    for (; i < maxDistance/stepSize; ++i) {  // Maximum iterations to avoid infinite loops
+        vec3 currentPos = rayOrigin - rayDirection * currentDistance;
+
+        // Convert current position to voxel grid coordinates
+        uvec3 voxelCoord = convert_world_coordinate_to_voxel(currentPos);
+
+        // Sample voxel data
+        uint index = convert_voxel_coordinates_to_index(voxelCoord);
+        float voxelValue = 0;
+        if (index < 0 || index > voxelInfo.voxel_count.x * voxelInfo.voxel_count.y * voxelInfo.voxel_count.z) {
+            voxelValue = 0;
+        } else {
+            voxelValue = voxels.data[index];
+        }
+
+        // Did we hit a smoke voxel?
+        if (voxelValue > VALUE_Empty && voxelValue < VALUE_Wall) {
+            
+            // Trilinear sample (manual from 3D array, since 3D textures don't work yet)
+            float trilin_value = sample_voxels_trilin(currentPos) - 1;
+
+            float worley_noise = getCombinedWorleyOffset(currentPos);
+            
+            uvec3 position = uvec3(floor(currentPos));
+            vec3 nachkomma = currentPos - position;
+
+            float distanz = trilin_value + worley_noise;
+
+            if (distanz <= voxelInfo.smoke_radius.x-1) {
+                vec3 color = getLightColor(currentPos); // What light sources influence our particle color?
+
+                float bullets = get_bullet_density(currentPos); // Did we sample inside a bullet hole?
+
+                first_depth = min(currentDistance, first_depth);    // set first depth to know how far inside the smoke we have traveled
+
+                absorption += 0.1 * clamp(worley_noise,0,1) * bullets;  // 0.1 guessed value that looks nice
+                
+                illumination += color * (1/(1+clamp(currentDistance-first_depth,0,1)));
+            }
+            
+        } else if (absorption != 0) {
+            steps_behind++; 
+        }
+
+        if (steps_behind > 2.0f / stepSize) { // Stop path trace if we exited the smoke volume
+            break;
+        }
+
+        if (absorption >= 1) break;
+
+        currentDistance += stepSize;
+
+        if (currentDistance > maxDistance) {
+            break;  // Exit if maximum distance is reached
+        }
+    }
+    if (illumination.x > 100) illumination = vec3(1,0,1);
+    return vec4(illumination + vec3(0.02, 0.02, 0.01), absorption); // Adding smoke color and ambient light
+}
+
+void main() {
+    bounds.x = voxelInfo.world_measurements.x;
+    bounds.y = voxelInfo.world_measurements.y;
+    bounds.z = voxelInfo.world_measurements.z;
+
+    voxel_size_half = voxelInfo.voxel_size.x/2;
+
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.x, -1 * (gl_GlobalInvocationID.y-270));
+
+    imageStore(screen, pixel_coords, voxel_addition());
+}

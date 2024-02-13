@@ -1,0 +1,71 @@
+#version 450
+#extension GL_KHR_vulkan_glsl : enable
+
+#define MAX_WORLEY_POINTS (50)
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+// Produces a 3D Worley noise that tiles in a 128 * 128 * 128 3D Storage Array.
+
+layout(std140, set = 0, binding = 0) uniform WorleyParams {
+    uint point_count;
+    float resolution;
+    float cutoff;
+    bool invert;
+} params;
+
+layout(set=0, binding = 1) buffer Randoms {
+	vec3 points_in_space[MAX_WORLEY_POINTS];
+} rand;
+
+layout(set=0, binding = 2) buffer Noise {
+    float data[128][128][128];
+} out_noise;
+
+//
+//              Shader Code
+//
+
+float mod_to_worley_res_f(float x) {
+    return mod(x, params.resolution);
+}
+
+vec3 mod_to_worley_res_vec(vec3 point) {
+    return vec3(
+        mod_to_worley_res_f(point.x),
+        mod_to_worley_res_f(point.y),
+        mod_to_worley_res_f(point.z)
+    );
+}
+
+vec3 worley_noise(vec3 sample_point) {
+    float closestDistance = 99999999;
+
+    int i = 0;
+    int closest = 0;
+    for (; i < params.point_count; i++) {
+        for (float x = -1.0; x <= 1.0; x+= 1.0) {
+            for (float y = -1.0; y <= 1.0; y+= 1.0) {
+                for (float z = -1.0; z <= 1.0; z+= 1.0) {
+
+		            float dist = distance(rand.points_in_space[i] + vec3(x,y,z) * params.resolution
+                    , mod_to_worley_res_vec(sample_point));
+		            if (dist < closestDistance) {
+                        closestDistance = dist;
+                        closest = i;
+                    }
+	            }
+            }
+        }
+    }
+    
+    return vec3(clamp(closestDistance, 0, params.cutoff) / params.cutoff);
+}
+
+void main() {
+    vec3 w = worley_noise(gl_GlobalInvocationID);
+    if (params.invert) w = vec3(1) - w;
+	//imageStore(out_noise, ivec3(gl_GlobalInvocationID), vec4(gl_GlobalInvocationID/params.resolution, 1));
+
+    out_noise.data[gl_GlobalInvocationID.x][gl_GlobalInvocationID.y][gl_GlobalInvocationID.z] = w.x;
+}
